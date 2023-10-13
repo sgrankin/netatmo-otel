@@ -191,7 +191,7 @@ func exportHistory(
 		if err := exporter.Export(ctx, rm); err != nil {
 			return err
 		}
-		log.Printf("Resume token: %s/%s/%s", device, module, nextTime)
+		log.Printf("Resume token: %s/%s/%d", device, module, nextTime.Unix())
 		return nil
 	})
 	if err != nil {
