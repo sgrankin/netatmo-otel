@@ -2,6 +2,12 @@ Export netatmo weather data into VictoriaMetrics or other OpenTelemetry destinat
 
 - https://www.netatmo.com
 
+# Install
+
+Build from source or `go install sgrankin.dev/netatmo-otel@latest`.
+
+# Run
+
 To access the API, create an application in Netatmo Connect and generate a token with a `read_station` scope.
 
 - https://dev.netatmo.com
