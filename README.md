@@ -10,7 +10,7 @@ Build from source or `go install sgrankin.dev/netatmo-otel@latest`.
 
 To access the API, create an application in Netatmo Connect and generate a token with a `read_station` scope.
 
-- https://dev.netatmo.com
+- https://dev.netatmo.com/apps
 - https://dev.netatmo.com/apidocumentation/oauth
 
 Pass the tokens via flags, environment, or config file. (See `-help`.)
