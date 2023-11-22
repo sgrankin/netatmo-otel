@@ -48,6 +48,8 @@ var (
 		"Query this far back to find the last written sample. If not found, uses -since as the starting point.")
 	scrapeSince = flag.Duration("since", 0,
 		"Start scrape this long ago. Set 0 to disable and start from the first recorded sample in netatmo.")
+
+	verbose = flag.Bool("verbose", false, "Verbose logging")
 )
 
 func init() {
@@ -93,7 +95,9 @@ func main() {
 		log.Fatal(err)
 	}
 	for _, dev := range stations {
-		log.Printf("exporting device %q", dev.ID)
+		if *verbose {
+			log.Printf("exporting device %q", dev.ID)
+		}
 		commonAttrs := []attribute.KeyValue{
 			attribute.String("home_id", dev.HomeID),
 			attribute.String("home_name", dev.HomeName),
@@ -107,7 +111,9 @@ func main() {
 		exportHistory(ctx, client, promAPI, exporter, attrs, dev.ID, "", dev.DataTypes)
 
 		for _, mod := range dev.Modules {
-			log.Printf("exporting device %q module %q", dev.ID, mod.ID)
+			if *verbose {
+				log.Printf("exporting device %q module %q", dev.ID, mod.ID)
+			}
 			attrs := attribute.NewSet(append(commonAttrs,
 				attribute.String("dev_id", string(mod.ID)),
 				attribute.String("module_name", mod.Name),
@@ -117,7 +123,6 @@ func main() {
 			exportHistory(ctx, client, promAPI, exporter, attrs, dev.ID, mod.ID, mod.DataTypes)
 		}
 	}
-
 }
 
 func exportHistory(
@@ -170,7 +175,8 @@ func exportHistory(
 				gauges[i].DataPoints = append(gauges[i].DataPoints, metricdata.DataPoint[float64]{
 					Attributes: attrs,
 					Time:       point.Time,
-					Value:      point.Values[i]},
+					Value:      point.Values[i],
+				},
 				)
 			}
 		}
@@ -181,17 +187,22 @@ func exportHistory(
 			metrics = append(metrics, metricdata.Metrics{
 				Name: "netatmo_" + strings.ToLower(string(dt)),
 				Data: gauge,
-				Unit: netatmo.DataUnits[dt]},
+				Unit: netatmo.DataUnits[dt],
+			},
 			)
 		}
 
 		rm := &metricdata.ResourceMetrics{ScopeMetrics: []metricdata.ScopeMetrics{{Metrics: metrics}}}
 
-		log.Printf("Exporting %d datapoints", len(gauges[0].DataPoints))
+		if *verbose {
+			log.Printf("Exporting %d datapoints", len(gauges[0].DataPoints))
+		}
 		if err := exporter.Export(ctx, rm); err != nil {
 			return err
 		}
-		log.Printf("Resume token: %s/%s/%d", device, module, nextTime.Unix())
+		if *verbose {
+			log.Printf("Resume token: %s/%s/%d", device, module, nextTime.Unix())
+		}
 		return nil
 	})
 	if err != nil {
