@@ -1,26 +1,31 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"maps"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/peterbourgon/ff/v4"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
-	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 
 	"sgrankin.dev/netatmo-otel/netatmo"
 
 	promclient "github.com/prometheus/client_golang/api"
 	promapi "github.com/prometheus/client_golang/api/prometheus/v1"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 )
 
@@ -70,18 +75,49 @@ func init() {
 
 func main() {
 	ctx := context.Background()
-	var exporter exporter
+	var exporter expfmt.Encoder
 	if *dest != "" {
-		exporter, _ = otlpmetrichttp.New(ctx,
-			otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
-			otlpmetrichttp.WithHeaders(map[string]string{"Content-Encoding": "gzip"}),
-			otlpmetrichttp.WithEndpoint(*dest),
-			otlpmetrichttp.WithInsecure(),
-			otlpmetrichttp.WithURLPath("/opentelemetry/api/v1/push"),
-		)
+		r, w, err := os.Pipe()
+		if err != nil {
+			log.Fatal(err)
+		}
+		g := &errgroup.Group{}
+		g.Go(func() error {
+			req, err := http.NewRequestWithContext(ctx, "POST", (&url.URL{
+				Scheme: "http", Host: *dest, Path: "/api/v1/import/prometheus",
+			}).String(), r)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Encoding", "gzip")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return err
+			}
+			dump, err := httputil.DumpResponse(resp, true)
+			if err != nil {
+				return err
+			}
+			log.Printf("response:\n%s", dump)
+			return nil
+		})
+		defer func() {
+			log.Print("waiting on upload to complete")
+			if err := g.Wait(); err != nil {
+				log.Fatal(err)
+			}
+		}()
+		defer w.Close()
+		gzw := gzip.NewWriter(w)
+		defer gzw.Close()
+		exporter = expfmt.NewEncoder(gzw, expfmt.FmtText)
 	} else {
-		exporter, _ = stdoutmetric.New(stdoutmetric.WithPrettyPrint())
+		exporter = expfmt.NewEncoder(os.Stdout, expfmt.FmtText)
 	}
+	exporter.Encode(&dto.MetricFamily{
+		Metric: []*dto.Metric{{}},
+	})
+
 	client := netatmo.NewClient(ctx, *clientID, *clientSecret, *accessToken, *refreshToken)
 
 	promClient, err := promclient.NewClient(promclient.Config{Address: "http://" + *dest})
@@ -98,28 +134,31 @@ func main() {
 		if *verbose {
 			log.Printf("exporting device %q", dev.ID)
 		}
-		commonAttrs := []attribute.KeyValue{
-			attribute.String("home_id", dev.HomeID),
-			attribute.String("home_name", dev.HomeName),
+		commonAttrs := map[string]string{
+			"home_id":   dev.HomeID,
+			"home_name": dev.HomeName,
 		}
-		attrs := attribute.NewSet(append(commonAttrs,
-			attribute.String("dev_id", string(dev.ID)),
-			attribute.String("module_name", dev.Name),
-			attribute.String("module_type", string(dev.Type)),
+
+		attrs := maps.Clone(commonAttrs)
+		maps.Copy(attrs, map[string]string{
+			"dev_id":      string(dev.ID),
+			"module_name": dev.Name,
+			"module_type": string(dev.Type),
 			// attribute.Int("firmware", dev.Firmware),
-		)...)
+		})
 		exportHistory(ctx, client, promAPI, exporter, attrs, dev.ID, "", dev.DataTypes)
 
 		for _, mod := range dev.Modules {
 			if *verbose {
 				log.Printf("exporting device %q module %q", dev.ID, mod.ID)
 			}
-			attrs := attribute.NewSet(append(commonAttrs,
-				attribute.String("dev_id", string(mod.ID)),
-				attribute.String("module_name", mod.Name),
-				attribute.String("module_type", string(mod.Type)),
+			attrs := maps.Clone(commonAttrs)
+			maps.Copy(attrs, map[string]string{
+				"dev_id":      string(mod.ID),
+				"module_name": mod.Name,
+				"module_type": string(mod.Type),
 				// attribute.Int("firmware", dev.Firmware),
-			)...)
+			})
 			exportHistory(ctx, client, promAPI, exporter, attrs, dev.ID, mod.ID, mod.DataTypes)
 		}
 	}
@@ -128,7 +167,7 @@ func main() {
 func exportHistory(
 	ctx context.Context,
 	client *netatmo.Client, promAPI promapi.API,
-	exporter exporter, attrs attribute.Set,
+	exporter expfmt.Encoder, attrs map[string]string,
 	device netatmo.DeviceID, module netatmo.ModuleID,
 	dataTypes []netatmo.DataType,
 ) {
@@ -167,39 +206,40 @@ func exportHistory(
 		*resume = ""
 	}
 
+	labels := []*dto.LabelPair{}
+	for k, v := range attrs {
+		labels = append(labels, &dto.LabelPair{
+			Name:  ptr(string(k)),
+			Value: ptr(string(v)),
+		})
+	}
+
 	err := client.GetMeasure(ctx, device, module, dataTypes, since, func(points []netatmo.DataPoint, nextTime time.Time) error {
 		// Gauges contain the datapoints.
-		gauges := make([]metricdata.Gauge[float64], len(dataTypes))
-		for _, point := range points {
-			for i := range dataTypes {
-				gauges[i].DataPoints = append(gauges[i].DataPoints, metricdata.DataPoint[float64]{
-					Attributes: attrs,
-					Time:       point.Time,
-					Value:      point.Values[i],
-				},
-				)
+		for i, dt := range dataTypes {
+			// MetricFamily gives the gauges a name and units.
+			mf := &dto.MetricFamily{
+				Name: ptr("netatmo_" + strings.ToLower(string(dt))),
+				Type: dto.MetricType_GAUGE.Enum(),
+			}
+			for _, point := range points {
+				mf.Metric = append(mf.Metric,
+					&dto.Metric{
+						Label:       labels,
+						TimestampMs: proto.Int64(point.Time.UnixMilli()),
+						Gauge: &dto.Gauge{
+							Value: proto.Float64(point.Values[i]),
+						},
+					})
+			}
+			if *verbose {
+				log.Printf("Exporting %d datapoints", len(mf.Metric))
+			}
+			if err := exporter.Encode(mf); err != nil {
+				return err
 			}
 		}
-		// Metrics give the gauges a name and units.
-		metrics := []metricdata.Metrics{}
-		for i, gauge := range gauges {
-			dt := dataTypes[i]
-			metrics = append(metrics, metricdata.Metrics{
-				Name: "netatmo_" + strings.ToLower(string(dt)),
-				Data: gauge,
-				Unit: netatmo.DataUnits[dt],
-			},
-			)
-		}
 
-		rm := &metricdata.ResourceMetrics{ScopeMetrics: []metricdata.ScopeMetrics{{Metrics: metrics}}}
-
-		if *verbose {
-			log.Printf("Exporting %d datapoints", len(gauges[0].DataPoints))
-		}
-		if err := exporter.Export(ctx, rm); err != nil {
-			return err
-		}
 		if *verbose {
 			log.Printf("Resume token: %s/%s/%d", device, module, nextTime.Unix())
 		}
@@ -210,6 +250,4 @@ func exportHistory(
 	}
 }
 
-type exporter interface {
-	Export(ctx context.Context, rm *metricdata.ResourceMetrics) error
-}
+func ptr[T any](v T) *T { return &v }
