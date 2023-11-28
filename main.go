@@ -94,11 +94,13 @@ func main() {
 			if err != nil {
 				return err
 			}
-			dump, err := httputil.DumpResponse(resp, true)
-			if err != nil {
-				return err
+			if *verbose {
+				dump, err := httputil.DumpResponse(resp, true)
+				if err != nil {
+					return err
+				}
+				log.Printf("response:\n%s", dump)
 			}
-			log.Printf("response:\n%s", dump)
 			return nil
 		})
 		defer func() {
