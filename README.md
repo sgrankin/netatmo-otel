@@ -1,4 +1,4 @@
-Export netatmo weather data into VictoriaMetrics or other OpenTelemetry destinations.
+Export netatmo weather data into VictoriaMetrics.
 
 - https://www.netatmo.com
 
