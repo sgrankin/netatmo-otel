@@ -18,7 +18,10 @@ type Client struct {
 	client  *http.Client
 }
 
-func NewClient(ctx context.Context, clientID, clientSecret, accessToken, refreshToken string) *Client {
+func NewClient(ctx context.Context,
+	clientID, clientSecret string, token oauth2.Token,
+	newToken func(*oauth2.Token, error) error,
+) *Client {
 	baseURL := "https://api.netatmo.net"
 	oa := oauth2.Config{
 		ClientID:     clientID,
@@ -28,17 +31,24 @@ func NewClient(ctx context.Context, clientID, clientSecret, accessToken, refresh
 	}
 
 	throttledClient := &http.Client{Transport: &throttledTransport{http.DefaultTransport,
-		rate.NewLimiter(rate.Limit(400.0/3600), 50), // 500 per hour, 50 per 10s; reduced for convenience.
+		rate.NewLimiter(rate.Limit(300.0/3600), 50), // 500 per hour, 50 per 10s; reduced for convenience.
 	}}
 
-	return &Client{
-		baseURL: baseURL,
-		client: oa.Client(
-			context.WithValue(ctx, oauth2.HTTPClient, throttledClient),
-			&oauth2.Token{AccessToken: accessToken, RefreshToken: refreshToken, Expiry: time.Now()},
-		),
-	}
+	ts := oauth2.ReuseTokenSource(nil, &NotifyingTokenSource{oa.TokenSource(ctx, &token), newToken})
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, throttledClient)
+	return &Client{baseURL: baseURL, client: oauth2.NewClient(ctx, ts)}
+}
 
+type NotifyingTokenSource struct {
+	oauth2.TokenSource
+	Notify func(*oauth2.Token, error) error
+}
+
+// Token implements oauth2.TokenSource.
+func (c *NotifyingTokenSource) Token() (*oauth2.Token, error) {
+	tok, err := c.TokenSource.Token()
+	err = c.Notify(tok, err)
+	return tok, err
 }
 
 func (c *Client) GetStations(ctx context.Context) ([]Station, error) {

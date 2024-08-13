@@ -12,13 +12,16 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/peterbourgon/ff/v4"
+	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
+	"tailscale.com/jsondb"
 
 	"sgrankin.dev/netatmo-otel/netatmo"
 
@@ -36,11 +39,6 @@ func init() {
 var (
 	_ = flag.String("config", "", "config file (optional)")
 
-	accessToken  = flag.String("access-token", "", "Oauth2 Access Token")
-	refreshToken = flag.String("refresh-token", "", "Oauth2 Refresh Token")
-	clientID     = flag.String("client-id", "", "Oauth2 Client ID")
-	clientSecret = flag.String("client-secret", "", "Oauth2 Client Secret")
-
 	dest = flag.String("dest", "",
 		"Destination host:port. Must accept Prometheus queries and OTLP pushes at routes matching VictoriaMetrics.")
 
@@ -49,7 +47,7 @@ var (
 
 	incremental = flag.Bool("incremental", true,
 		"Query for the last timestamp exported and start scrape from there.")
-	incrementalSince = flag.Duration("incremental-since", 30*24*time.Hour,
+	incrementalSince = flag.Duration("incremental-since", 90*24*time.Hour,
 		"Query this far back to find the last written sample. If not found, uses -since as the starting point.")
 	scrapeSince = flag.Duration("since", 0,
 		"Start scrape this long ago. Set 0 to disable and start from the first recorded sample in netatmo.")
@@ -73,13 +71,36 @@ func init() {
 	}
 }
 
+type Config struct {
+	Token        oauth2.Token `json:"token,omitempty"`
+	ClientID     string       `json:"client_id,omitempty"`
+	ClientSecret string       `json:"client_secret,omitempty"`
+}
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	ctx := context.Background()
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return err
+	}
+
+	configDB, err := jsondb.Open[Config](filepath.Join(configDir, "netatmo", "config.json"))
+	if err != nil {
+		return err
+	}
+
 	var exporter expfmt.Encoder
 	if *dest != "" {
 		r, w, err := os.Pipe()
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		g := &errgroup.Group{}
 		g.Go(func() error {
@@ -112,25 +133,34 @@ func main() {
 		defer w.Close()
 		gzw := gzip.NewWriter(w)
 		defer gzw.Close()
-		exporter = expfmt.NewEncoder(gzw, expfmt.FmtText)
+		exporter = expfmt.NewEncoder(gzw, expfmt.NewFormat(expfmt.TypeTextPlain))
 	} else {
-		exporter = expfmt.NewEncoder(os.Stdout, expfmt.FmtText)
+		exporter = expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeTextPlain))
 	}
 	exporter.Encode(&dto.MetricFamily{
 		Metric: []*dto.Metric{{}},
 	})
 
-	client := netatmo.NewClient(ctx, *clientID, *clientSecret, *accessToken, *refreshToken)
+	config := configDB.Data
+
+	client := netatmo.NewClient(ctx, config.ClientID, config.ClientSecret, config.Token,
+		func(t *oauth2.Token, err error) error {
+			if err == nil {
+				configDB.Data.Token = *t
+				return configDB.Save()
+			}
+			return err
+		})
 
 	promClient, err := promclient.NewClient(promclient.Config{Address: "http://" + *dest})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	promAPI := promapi.NewAPI(promClient)
 
 	stations, err := client.GetStations(ctx)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	for _, dev := range stations {
 		if *verbose {
@@ -164,6 +194,7 @@ func main() {
 			exportHistory(ctx, client, promAPI, exporter, attrs, dev.ID, mod.ID, mod.DataTypes)
 		}
 	}
+	return nil
 }
 
 func exportHistory(
@@ -172,14 +203,14 @@ func exportHistory(
 	exporter expfmt.Encoder, attrs map[string]string,
 	device netatmo.DeviceID, module netatmo.ModuleID,
 	dataTypes []netatmo.DataType,
-) {
+) error {
 	var since time.Time
 	if *incremental {
 		val, _, err := promAPI.Query(ctx,
 			fmt.Sprintf("timestamp(netatmo_%s[%s])", strings.ToLower(string(dataTypes[0])), incrementalSince.String()),
 			time.Now())
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		vec := val.(model.Vector)
 		for _, sample := range vec {
@@ -198,11 +229,11 @@ func exportHistory(
 		r := strings.Split(*resume, "/")
 		if r[0] != string(device) || r[1] != string(module) {
 			// Token was given and it has some other module.. probably skip ahead.
-			return
+			return nil
 		}
 		sec, err := strconv.Atoi(r[2])
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		since = time.Unix(int64(sec), 0)
 		*resume = ""
@@ -248,8 +279,9 @@ func exportHistory(
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func ptr[T any](v T) *T { return &v }
