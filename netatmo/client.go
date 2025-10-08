@@ -22,7 +22,7 @@ func NewClient(ctx context.Context,
 	clientID, clientSecret string, token oauth2.Token,
 	newToken func(*oauth2.Token, error) error,
 ) *Client {
-	baseURL := "https://api.netatmo.net"
+	baseURL := "https://api.netatmo.com"
 	oa := oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
@@ -30,7 +30,8 @@ func NewClient(ctx context.Context,
 		Endpoint:     oauth2.Endpoint{AuthURL: baseURL + "/oauth/authorize", TokenURL: baseURL + "/oauth2/token"},
 	}
 
-	throttledClient := &http.Client{Transport: &throttledTransport{http.DefaultTransport,
+	throttledClient := &http.Client{Transport: &throttledTransport{
+		http.DefaultTransport,
 		rate.NewLimiter(rate.Limit(300.0/3600), 50), // 500 per hour, 50 per 10s; reduced for convenience.
 	}}
 
